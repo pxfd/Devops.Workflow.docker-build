@@ -1,0 +1,261 @@
+name: docker_build_reusable_workflow
+
+on:
+  workflow_call:
+    inputs:
+      runs_on_default:
+        required: true
+        type: string
+      runs_on_prefix:
+        required: true
+        type: string
+      vault_url:
+        required: true
+        type: string
+      vault_role:
+        required: true
+        type: string
+      vault_secrets:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+      docker_build_push:
+        required: false
+        type: boolean
+        default: true
+      docker_build_tags:
+        required: true
+        type: string
+      docker_build_cache_from:
+        required: false
+        type: string
+        default: ''
+      docker_build_context:
+        required: false
+        type: string
+        default: '.'
+      docker_build_args:
+        required: false
+        type: string
+        default: ''
+      docker_buildx_config:
+        required: false
+        type: string
+        default: ''
+      vulnerability_scan:
+        description: 'Run Trivy vulnerability scan'
+        required: false
+        type: boolean
+        default: false
+      ecr_registry:
+        required: true
+        type: string
+      ecr_repo:
+        required: true
+        type: string
+      ecr_username:
+        required: true
+        type: string
+      custom_tag:
+        description: 'Tag to build'
+        required: false
+        type: string
+      slack_channel:
+        required: true
+        type: string
+      slack_username:
+        required: true
+        type: string
+      slack_build_name:
+        required: true
+        type: string
+      src_repository:
+        required: true
+        type: string
+      semver_pft:
+        required: false
+        type: string
+        default: ''
+      semver_ut:
+        required: false
+        type: string
+        default: ''
+      semver_mmp:
+        required: false
+        type: string
+        default: ''
+      semver_mm:
+        required: false
+        type: string
+        default: ''
+      semver_m:
+        required: false
+        type: string
+        default: ''
+      manifest_template:
+        required: true
+        type: string
+      manifest_tags:
+        required: true
+        type: string
+      manifest_platforms:
+        required: true
+        type: string
+
+jobs:
+  build-and-push:
+    strategy:
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    runs-on: ${{ inputs.runs_on_prefix }}-${{ matrix.arch }}
+    outputs:
+      ecr_password: ${{ env.ecr_password }}
+    steps:
+      - name: Import secrets
+        id: secrets
+        uses: hashicorp/vault-action@v2.4.2
+        with:
+          url: ${{ inputs.vault_url }}
+          method: kubernetes
+          role: ${{ inputs.vault_role }}
+          secrets: ${{ inputs.vault_secrets }}
+
+      - name: Prepare semver tags
+        env:
+          semver_pft: ${{ inputs.semver_pft }}
+          semver_ut: ${{ inputs.semver_ut }}
+          semver_mmp: ${{ inputs.semver_mmp }}
+          semver_mm: ${{ inputs.semver_mm }}
+          semver_m: ${{ inputs.semver_m }}
+        run: |
+          BUILD_CACHE_FROM=$(b_cache_from="semver_${{ inputs.docker_build_cache_from }}"; echo "${!b_cache_from}")
+          BUILD_TAGS=$(for i in ${{ inputs.docker_build_tags }}; do
+            b_ver="semver_${i}";
+            [ ! -z "${!b_ver}" ] && echo -n "${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${!b_ver}-${{ matrix.arch }},";
+            done)
+
+          # use first tag from BUILD_TAGS for vulnerability scanning
+          TRIVY_SCAN_IMG=$(echo ${BUILD_TAGS} | cut -d ',' -f1)
+
+          echo "build_tags=${BUILD_TAGS}" >> $GITHUB_ENV
+          echo "build_cache_from=${BUILD_CACHE_FROM}" >> $GITHUB_ENV
+          echo "trivy_scan_img=${TRIVY_SCAN_IMG}" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ inputs.src_repository }}
+          ref: ${{ steps.tag.outputs.pftag }}
+          fetch-depth: 1
+          token: ${{ steps.secrets.outputs.github_token }}
+
+      - name: Create docker context
+        run: |
+          docker context create ctx
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v2
+        id: buildx
+        with:
+          config-inline: ${{ inputs.docker_buildx_config }}
+          endpoint: ctx
+          driver-opts: env.BUILDKIT_STEP_LOG_MAX_SIZE=10485760,env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760
+
+      - name: Inspect builder
+        run: |
+          echo "Name:       ${{ steps.buildx.outputs.name }}"
+          echo "Endpoint:   ${{ steps.buildx.outputs.endpoint }}"
+          echo "Status:     ${{ steps.buildx.outputs.status }}"
+          echo "Flags:      ${{ steps.buildx.outputs.flags }}"
+          echo "Platforms:  ${{ steps.buildx.outputs.platforms }}"
+          echo "Semver pft: ${{ inputs.semver_pft }}"
+          echo "Semver ut:  ${{ inputs.semver_ut }}"
+          echo "Semver mm:  ${{ inputs.semver_mm }}"
+          echo "Semver m:   ${{ inputs.semver_m }}"
+
+      - name: Build and push - base
+        uses: docker/build-push-action@v3
+        with:
+          push: ${{ inputs.docker_build_push }}
+          tags: ${{ env.build_tags }}
+          builder: ${{ steps.buildx.outputs.name }}
+          file: ${{ inputs.dockerfile }}
+          context: ${{ inputs.docker_build_context }}
+          platforms: linux/${{ matrix.arch }}
+          cache-from: ${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${{ env.build_cache_from }}-${{ matrix.arch }}
+          cache-to: type=inline
+          build-args: ${{ inputs.docker_build_args }}
+
+      - name: Get ECR login
+        if: ${{ inputs.vulnerability_scan }}
+        run: |
+          set -u
+          ECR_PASSWORD=$(aws ecr get-login-password)
+          echo "::add-mask::${ECR_PASSWORD}"
+          echo "ecr_password=${ECR_PASSWORD}" >> $GITHUB_ENV
+
+      - name: Run Trivy vulnerability scanner
+        if: ${{ inputs.vulnerability_scan }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.trivy_scan_img }}
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        env:
+          TRIVY_USERNAME: ${{ inputs.ecr_username }}
+          TRIVY_PASSWORD: ${{ env.ecr_password }}
+
+  push-multiarch-manifest:
+    needs: build-and-push
+    runs-on: ${{ inputs.runs_on_default }}
+    strategy:
+      matrix:
+        manifest_tag: ${{ fromJson(inputs.manifest_tags) }}
+    steps:
+      - name: Get ECR login
+        run: |
+          set -u
+          ECR_PASSWORD=$(aws ecr get-login-password)
+          echo "::add-mask::${ECR_PASSWORD}"
+          echo "ecr_password=${ECR_PASSWORD}" >> $GITHUB_ENV
+
+      - name: Push manifest
+        uses: pixelfederation/gh-action-manifest-tool@v0.1.6
+        with:
+          username: ${{ inputs.ecr_username }}
+          password: ${{ env.ecr_password }}
+          platforms: ${{ inputs.manifest_platforms }}
+          template: ${{ inputs.manifest_template }}
+          target: ${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${{ matrix.manifest_tag }}
+
+  send-slack-notification:
+    needs: push-multiarch-manifest
+    runs-on: ${{ inputs.runs_on_default }}
+    steps:
+      - name: Import secrets
+        id: secrets
+        uses: hashicorp/vault-action@v2.4.2
+        with:
+          url: ${{ inputs.vault_url }}
+          method: kubernetes
+          role: ${{ inputs.vault_role }}
+          secrets: ${{ inputs.vault_secrets }}
+
+      - name: Slack notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ steps.secrets.outputs.slack_info_webhook }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel  }}
+          SLACK_USERNAME: ${{ inputs.slack_username }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_TITLE: "${{ inputs.slack_build_name }} build status: ${{ job.status }}"
+          SLACK_MESSAGE: "${{ inputs.slack_build_name }} image tags: ${{ inputs.manifest_tags }} "
+          SLACK_ICON: https://i.postimg.cc/RVG6bWcm/github-actions-pxfd.png
