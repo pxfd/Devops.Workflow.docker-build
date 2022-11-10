@@ -28,10 +28,9 @@ on:
       docker_build_tags:
         required: true
         type: string
-      docker_build_cache_from:
-        required: false
+      docker_build_cache_tag:
+        required: true
         type: string
-        default: ''
       docker_build_context:
         required: false
         type: string
@@ -132,17 +131,14 @@ jobs:
           semver_mm: ${{ inputs.semver_mm }}
           semver_m: ${{ inputs.semver_m }}
         run: |
-          BUILD_CACHE_FROM=$(b_cache_from="semver_${{ inputs.docker_build_cache_from }}"; echo "${!b_cache_from}")
-          BUILD_TAGS=$(for i in ${{ inputs.docker_build_tags }}; do
-            b_ver="semver_${i}";
-            [ ! -z "${!b_ver}" ] && echo -n "${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${!b_ver}-${{ matrix.arch }},";
+          BUILD_TAGS=$(for tag in ${{ inputs.docker_build_tags }}; do
+            echo -n "${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${tag}-${{ matrix.arch }},";
             done)
 
           # use first tag from BUILD_TAGS for vulnerability scanning
           TRIVY_SCAN_IMG=$(echo ${BUILD_TAGS} | cut -d ',' -f1)
 
           echo "build_tags=${BUILD_TAGS}" >> $GITHUB_ENV
-          echo "build_cache_from=${BUILD_CACHE_FROM}" >> $GITHUB_ENV
           echo "trivy_scan_img=${TRIVY_SCAN_IMG}" >> $GITHUB_ENV
 
       - name: Checkout
@@ -186,7 +182,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           context: ${{ inputs.docker_build_context }}
           platforms: linux/${{ matrix.arch }}
-          cache-from: ${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${{ env.build_cache_from }}-${{ matrix.arch }}
+          cache-from: ${{ inputs.ecr_registry }}/${{ inputs.ecr_repo }}:${{ inputs.docker_build_cache_tag }}-${{ matrix.arch }}
           cache-to: type=inline
           build-args: ${{ inputs.docker_build_args }}
 
